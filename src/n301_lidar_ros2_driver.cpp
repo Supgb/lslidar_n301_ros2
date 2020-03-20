@@ -8,27 +8,44 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <chrono>
-#include <memory>
+#include <flann/config.h>
 
-#include <tf2_ros/transform_listener.h>
-#include <N301_lidar_ros2/n301_lidar_ros2_driver.hpp>
+#include "tf2_ros/transform_listener.h"
+#include "n301_lidar_ros2/n301_lidar_ros2_driver.hpp"
 
 namespace lslidar_n301_driver {
 
-LslidarDriver::LslidarDriver(const std::string& frame_id = "lslidar",
-                            const std::string& device_ip_string = "192.168.1.222",
-                            const int& device_port = 2368):
+using namespace std::chrono_literals;    
+
+LslidarDriver::LslidarDriver(const std::string& name, const std::string& frame_id,
+                            const std::string& device_ip_string,
+                            const int& device_port):
+    Node(name, rclcpp::NodeOptions().use_intra_process_comms(true)),
     device_ip_string(device_ip_string),
     device_ip(),
     UDP_PORT_NUMBER(device_port),
     socket_id(-1),
     frame_id(frame_id),
-    packet_pub(),
+    packet_pub(this->create_publisher<n301_lidar_ros2::msg::LslidarN301Packet>(
+        "lslidar_packet", 100
+    )),
     p_frame_id("frame_id", frame_id),
     p_device_ip("device_ip", device_ip_string),
-    p_device_port("device_port", UDP_PORT_NUMBER) {}
+    p_device_port("device_port", UDP_PORT_NUMBER),
+    timer_() {
+        if (!this->initialize()) {
+            RCLCPP_ERROR(this->get_logger(), "Could not initialize the driver...");
+        }
+        RCLCPP_INFO(this->get_logger(), "Successfully initialize driver...");
+        //timer_ = this->create_wall_timer(2s, std::bind(&LslidarDriver::polling, this));
+    }
 
 bool LslidarDriver::loadParameters() {
+    std::vector<std::string> parameters = {"frame_id", "device_ip", "device_port"};
+    std::for_each(parameters.begin(), parameters.end(), [&](std::string s) {
+        this->declare_parameter(s);
+    });
+
     this->set_parameter(p_frame_id);
     this->set_parameter(p_device_ip);
     this->set_parameter(p_device_port);
@@ -43,9 +60,6 @@ bool LslidarDriver::loadParameters() {
 bool LslidarDriver::createRosIO() {
     // TODO: diagnostics confirgurations.
 
-    packet_pub = this->create_publisher<lslidar_n301_msgs::LslidarN301Packet>(
-        "lslidar_packet", 100
-    )
     return true;
 }
 
@@ -62,7 +76,7 @@ bool LslidarDriver::openUDPPort() {
     RCLCPP_INFO_STREAM(this->get_logger(), "Opening UDP socket: port " << UDP_PORT_NUMBER);
     host_addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(socket_id, reinterpret_cast<sockaddr *>(&my_addr), sizeof(sockaddr)) == -1) {
+    if (bind(socket_id, reinterpret_cast<sockaddr *>(&host_addr), sizeof(sockaddr)) == -1) {
         perror("bind");
         return false;
     }
@@ -75,24 +89,24 @@ bool LslidarDriver::openUDPPort() {
     return true;
 }
 
-bool LslidarN301Driver::initialize() {
+bool LslidarDriver::initialize() {
     if (!loadParameters()) {
-        RCLCPP_ERROR("Could not load all required ROS2 parameters...");
+        RCLCPP_ERROR(this->get_logger(), "Could not load all required ROS2 parameters...");
         return false;
     }
     if (!createRosIO()) {
-        RCLCPP_ERROR("Could not create all ROS2 IO...");
+        RCLCPP_ERROR(this->get_logger(), "Could not create all ROS2 IO...");
         return false;
     }
     if (!openUDPPort()) {
-        RCLCPP_ERROR("Could not open UDP port...");
+        RCLCPP_ERROR(this->get_logger(), "Could not open UDP port...");
         return false;
     }
-    RCLCPP_INFO("Initialized lslidar without error");
+    RCLCPP_INFO(this->get_logger(), "Initialized lslidar without error");
     return true;
 }
 
-int LslidarDriver::getPacket(lslidar_n301_msgs::LslidarN301PacketPtr& packet) {
+int LslidarDriver::getPacket(n301_lidar_ros2::msg::LslidarN301Packet::UniquePtr& packet) {
     rclcpp::Time time1 = this->now();
     struct pollfd fds[1];
     fds[0].fd = socket_id;
@@ -108,28 +122,28 @@ int LslidarDriver::getPacket(lslidar_n301_msgs::LslidarN301PacketPtr& packet) {
             int retval = poll(fds, 1, POLL_TIMEOUT);
             if (retval < 0) {   // error?
                 if (errno != EINTR)
-                    RCLCPP_ERROR(this->get_logger(), strerror(errno));
+                    RCLCPP_ERROR(this->get_logger(), "lslidar poll() ERROR!!!");
                 return 1;
             }
             if (retval == 0) {  // timeout?
-                RCLCPP_WARN("lslidar poll() timeout...");
+                RCLCPP_WARN(this->get_logger(), "lslidar poll() timeout...");
                 return 1;
             }
             if ((fds[0].revents & POLLERR)
                 || (fds[0].revents & POLLHUP)
                 || (fds[0].revents & POLLNVAL)) {   // device error? 
-                    RCLCPP_ERROR("poll() reports lslidar error");
+                    RCLCPP_ERROR(this->get_logger(), "poll() reports lslidar error");
                     return 1;
                 }
-        } while ((fds[0].revents & POLLERR) == 0);  // poll until input available
+        } while ((fds[0].revents & POLLIN) == 0);  // poll until input available
 
-        ssize_t nbytes = recvfrom(socket_id, &packet->data[0], PACKET_SIZE, 0
+        ssize_t nbytes = recvfrom(socket_id, &packet->data[0], PACKET_SIZE, 0,
             reinterpret_cast<sockaddr*>(&sender_address), &sender_address_len);
 
         if (nbytes < 0) {
             if (errno != EWOULDBLOCK) {
                 perror("recvfail");
-                RCLCPP_ERROR("recvfail");
+                RCLCPP_ERROR(this->get_logger(), "recvfail");
                 return 1;
             }
         } else if (static_cast<size_t>(nbytes) == PACKET_SIZE) {    // Success.
@@ -144,14 +158,15 @@ int LslidarDriver::getPacket(lslidar_n301_msgs::LslidarN301PacketPtr& packet) {
 
 bool LslidarDriver::polling() {
     // For zero-copy sharing.
-    std::unique_ptr packet =  std::make_unique<lslidar_n301_msgs::LslidarN301Packet>();
+    auto packet =  n301_lidar_ros2::msg::LslidarN301Packet::UniquePtr(
+        new n301_lidar_ros2::msg::LslidarN301Packet());
     while (1) {
         int rc = getPacket(packet);
         if (rc == 0) break; // got a packet?
         if (rc < 0) return false;
     }
-    RCLCPP_DEBUG("Publishing a full lslidar scan.").
-    packet_pub.publish(*packet);
+    RCLCPP_DEBUG(this->get_logger(), "Publishing a full lslidar scan.");
+    packet_pub->publish(std::move(packet));
 
     // TODO: diagnostics issuses.
 
